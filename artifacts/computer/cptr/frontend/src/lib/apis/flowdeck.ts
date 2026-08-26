@@ -1,5 +1,13 @@
 import { fetchHandler, fetchJSON, jsonBody } from '$lib/apis';
 
+export interface FlowDeckTerminalView {
+	run_id: string;
+	mode: 'observer';
+	available: boolean;
+	state: string;
+	ws_path: string | null;
+}
+
 export interface FlowDeckOrchestration {
 	run_id?: string;
 	id?: string;
@@ -259,6 +267,16 @@ export async function getFlowDeckOrchestration(
 	const query = new URLSearchParams({ workspace });
 	return fetchJSON<FlowDeckOrchestration>(
 		`/v1/flowdeck/orchestrations/${encodeURIComponent(runId)}?${query.toString()}`
+	);
+}
+
+export async function getFlowDeckTerminalView(
+	runId: string,
+	workspace: string
+): Promise<FlowDeckTerminalView> {
+	const query = new URLSearchParams({ workspace });
+	return fetchJSON<FlowDeckTerminalView>(
+		`/v1/flowdeck/orchestrations/${encodeURIComponent(runId)}/terminal-view?${query.toString()}`
 	);
 }
 

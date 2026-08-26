@@ -29,6 +29,7 @@
 	createNewFlowDeckRun,
 		createFlowDeckOrchestration,
 		getFlowDeckOrchestration,
+		getFlowDeckTerminalView,
 		steerFlowDeckOrchestration
 	} from '$lib/apis/flowdeck';
 	import type { ChatAgent } from '../common/AgentSelector.svelte';
@@ -66,7 +67,9 @@
 
 	import ChatInput from './ChatInput.svelte';
 	import FlowDeckStatusStrip from './FlowDeckStatusStrip.svelte';
-import LiveTerminal from './LiveTerminal.svelte';
+	import AgentTerminalPane from './AgentTerminalPane.svelte';
+	import LiveTerminal from './LiveTerminal.svelte';
+
 	import type { DesignerAction } from './DesignerResults.svelte';
 	import UserMessage from './UserMessage.svelte';
 	import AssistantMessage from './AssistantMessage.svelte';
@@ -148,9 +151,12 @@ import LiveTerminal from './LiveTerminal.svelte';
 	let chatInputEl: ChatInput;
 	let statusButtonEl: HTMLButtonElement | undefined = $state();
 	let sending = $state(false);
-	let flowdeckStatus = $state('');
-	let flowdeckRunId = $state('');
-	let flowdeckIsAudit = $state(false);
+			let flowdeckStatus = $state('');
+		let flowdeckRunId = $state('');
+		let flowdeckTerminalWsPath = $state<string | null>(null);
+		let flowdeckTerminalViewRunId = $state('');
+		let flowdeckIsAudit = $state(false);
+
 	const flowdeckTelemetry = $derived.by(() => {
 		const totals = {
 			input_tokens: 0,
@@ -205,9 +211,24 @@ let flowdeckEvidenceSummary = $state<any>(null);
 		'orphaned'
 	]);
 
-	function isFlowDeckTerminal(status: string) {
-		return FLOWDECK_TERMINAL_STATUSES.has(status.toLowerCase());
-	}
+			function isFlowDeckTerminal(status: string) {
+			return FLOWDECK_TERMINAL_STATUSES.has(status.toLowerCase());
+		}
+
+		async function refreshFlowDeckTerminalView(runId: string) {
+			if (!workspace || !runId || isFlowDeckTerminal(flowdeckStatus)) return;
+			if (flowdeckTerminalViewRunId === runId && flowdeckTerminalWsPath) return;
+			try {
+				const view = await getFlowDeckTerminalView(runId, workspace);
+				if (runId !== flowdeckRunId) return;
+				flowdeckTerminalViewRunId = runId;
+				flowdeckTerminalWsPath = view.available ? view.ws_path : null;
+			} catch {
+				// A live viewer is optional. Keep the event-card fallback truthful.
+				if (runId === flowdeckRunId) flowdeckTerminalWsPath = null;
+			}
+		}
+
 	let autoScroll = $state(true);
 	let cancelledMessageId: string | null = null;
 	let loading = $state(!!initialChatId);
@@ -1544,6 +1565,7 @@ const poll = async () => {
 			try {
 				const state = await getFlowDeckOrchestration(runId, workspace);
 				flowdeckStatus = String(state.status || state.state || 'active').toLowerCase();
+				void refreshFlowDeckTerminalView(runId);
 if (Array.isArray(state.events)) {
 	mergeFlowDeckEvents(state.events, runId);
 	// Replay responses are authoritative snapshots. Publish the complete
@@ -1589,6 +1611,8 @@ flowdeckPoller = setInterval(poll, 2500);
 		// Show truthful feedback while the immediate durable-run POST is in flight.
 		flowdeckStatus = 'preparing';
 		flowdeckRunId = '';
+		flowdeckTerminalWsPath = null;
+		flowdeckTerminalViewRunId = '';
 		flowdeckIsAudit = /\baudit\b/i.test(text);
 		flowdeckEventBuffer = [];
 		flowdeckEvents = [];
@@ -2507,13 +2531,22 @@ if (flowdeckRunId) {
 				</div>
 
 {#if selectedAgent === 'heidi' && (flowdeckStatus || sending)}
-<LiveTerminal
-events={flowdeckEvents}
-status={flowdeckStatus}
-runId={flowdeckRunId}
-isAudit={flowdeckIsAudit}
-onretry={handleRetryTerminalCommand}
-/>
+{#if flowdeckTerminalWsPath && flowdeckTerminalViewRunId === flowdeckRunId}
+	<AgentTerminalPane
+		runId={flowdeckRunId}
+		status={flowdeckStatus}
+		wsPath={flowdeckTerminalWsPath}
+		oncancel={handleCancel}
+	/>
+{:else}
+	<LiveTerminal
+		events={flowdeckEvents}
+		status={flowdeckStatus}
+		runId={flowdeckRunId}
+		isAudit={flowdeckIsAudit}
+		onretry={handleRetryTerminalCommand}
+	/>
+{/if}
 					<FlowDeckStatusStrip
 						status={flowdeckStatus}
 						runId={flowdeckRunId}
@@ -2663,13 +2696,22 @@ class="shrink-0 px-4 py-3 {selectedAgent === 'heidi' ? 'heidi-lower-interaction'
 					</div>
 				{/if}
 {#if selectedAgent === 'heidi' && (flowdeckStatus || sending)}
-<LiveTerminal
-events={flowdeckEvents}
-status={flowdeckStatus}
-runId={flowdeckRunId}
-isAudit={flowdeckIsAudit}
-onretry={handleRetryTerminalCommand}
-/>
+{#if flowdeckTerminalWsPath && flowdeckTerminalViewRunId === flowdeckRunId}
+	<AgentTerminalPane
+		runId={flowdeckRunId}
+		status={flowdeckStatus}
+		wsPath={flowdeckTerminalWsPath}
+		oncancel={handleCancel}
+	/>
+{:else}
+	<LiveTerminal
+		events={flowdeckEvents}
+		status={flowdeckStatus}
+		runId={flowdeckRunId}
+		isAudit={flowdeckIsAudit}
+		onretry={handleRetryTerminalCommand}
+	/>
+{/if}
 					<FlowDeckStatusStrip
 						status={flowdeckStatus}
 						runId={flowdeckRunId}

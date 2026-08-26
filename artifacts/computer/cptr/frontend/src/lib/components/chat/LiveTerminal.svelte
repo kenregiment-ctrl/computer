@@ -14,7 +14,7 @@ let { events = [], status = '', runId = '', isAudit = false, onretry }: Props = 
 let open = $state(true);
 let follow = $state(true);
 let auditReportOpen = $state(false);
-let outputEl: HTMLDivElement;
+let outputEl = $state<HTMLDivElement | undefined>();
 
 const terminalStatuses = new Set([
 'succeeded',

@@ -13,7 +13,7 @@ import logging
 import re
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import and_, or_, select
 from starlette.responses import StreamingResponse
@@ -72,6 +72,11 @@ from cptr.utils.config import now_ms
 from cptr.routers.gateway import _authenticate, _resolve_model
 from cptr.utils.config import check_access
 from cptr.utils.db import get_session_factory
+from cptr.flowdeck.agent_terminal import (
+    agent_terminal_viewer_available,
+    subscribe_agent_terminal_viewer,
+    unsubscribe_agent_terminal_viewer,
+)
 
 router = APIRouter(prefix="/v1/flowdeck", tags=["flowdeck"])
 logger = logging.getLogger(__name__)
@@ -693,6 +698,39 @@ async def _owned_run(request: Request, run_id: str, workspace: str):
     return user_id, canonical, run
 
 
+async def _authenticate_flowdeck_socket(websocket: WebSocket) -> str:
+    """Apply FlowDeck browser/Bearer authentication to a WebSocket upgrade."""
+    if websocket.headers.get("Authorization", "").startswith("Bearer "):
+        return await _authenticate(websocket)  # type: ignore[arg-type]
+    session_token = websocket.cookies.get("cptr_session")
+    auth = check_access(
+        client_host=websocket.client.host if websocket.client else "127.0.0.1",
+        jwt_token=session_token,
+    )
+    if auth is None or not auth.user_id:
+        raise HTTPException(401, "Authentication required")
+    websocket.state.auth = auth
+    return auth.user_id
+
+
+async def _owned_run_socket(websocket: WebSocket, run_id: str, workspace: str):
+    user_id = await _authenticate_flowdeck_socket(websocket)
+    try:
+        canonical = await resolve_gateway_workspace(
+            session_factory=get_session_factory(),
+            user_id=user_id,
+            requested_workspace=workspace,
+        )
+    except AuthenticatedGatewayError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    run = await DurableFlowDeck(get_session_factory()).get_run_for_owner(
+        run_id=run_id, owner=user_id, workspace=canonical
+    )
+    if not run:
+        raise HTTPException(404, "orchestration run not found")
+    return user_id, canonical, run
+
+
 async def _create_orchestration(
     request: Request,
     body: OrchestrationRequest,
@@ -1279,6 +1317,95 @@ async def steer_orchestration(request: Request, run_id: str, body: SteeringReque
         "chat_id": chat.id,
         "message_id": steering.id,
     }
+
+
+@router.get("/orchestrations/{run_id}/terminal-view")
+async def get_terminal_view_capability(request: Request, run_id: str, workspace: str):
+    """Describe the owner's read-only live-terminal viewer, if one is active.
+
+    The response deliberately exposes no direct terminal session identifier.
+    The WebSocket can only mirror bytes and cannot send input, resize, or stop
+    the agent-owned PTY.
+    """
+    user_id, _, run = await _owned_run(request, run_id, workspace)
+    available = await agent_terminal_viewer_available(user_id=user_id, run_id=run.id)
+    from urllib.parse import urlencode
+
+    query = urlencode({"workspace": workspace})
+    return {
+        "run_id": run.id,
+        "mode": "observer",
+        "available": available,
+        "state": "attached" if available else run.status.lower(),
+        "ws_path": (
+            f"/v1/flowdeck/orchestrations/{run.id}/terminal-view/ws?{query}" if available else None
+        ),
+    }
+
+
+@router.websocket("/orchestrations/{run_id}/terminal-view/ws")
+async def flowdeck_terminal_view_ws(websocket: WebSocket, run_id: str, workspace: str):
+    """Stream an authorized, read-only mirror of an agent-owned terminal.
+
+    The FlowDeck PTY is read once by the agent runtime. This route only drains
+    brokered bytes and closes any client that tries to send a control packet.
+    """
+    subscription = None
+    user_id = ""
+    try:
+        user_id, _, run = await _owned_run_socket(websocket, run_id, workspace)
+        try:
+            offset = max(0, int(websocket.query_params.get("offset", "0")))
+        except ValueError:
+            await websocket.close(code=4400, reason="invalid terminal offset")
+            return
+        subscription = await subscribe_agent_terminal_viewer(
+            user_id=user_id, run_id=run.id, offset=offset
+        )
+        if subscription is None:
+            await websocket.close(code=4404, reason="terminal viewer unavailable")
+            return
+        await websocket.accept()
+        if subscription.replay_truncated:
+            await websocket.send_text(json.dumps({"type": "replay_truncated"}))
+
+        async def send_output() -> None:
+            while True:
+                chunk = await subscription.queue.get()
+                if chunk is None:
+                    return
+                await websocket.send_bytes(chunk)
+
+        async def reject_client_input() -> None:
+            await websocket.receive()
+
+        output_task = asyncio.create_task(send_output())
+        input_task = asyncio.create_task(reject_client_input())
+        done, pending = await asyncio.wait(
+            {output_task, input_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if input_task in done and not output_task.done():
+            await websocket.close(code=4403, reason="terminal viewer is read-only")
+        else:
+            await websocket.close(code=1000)
+    except WebSocketDisconnect:
+        return
+    except HTTPException as exc:
+        await websocket.close(code=4401 if exc.status_code == 401 else 4404, reason=str(exc.detail))
+    except Exception:
+        logger.exception("FlowDeck terminal viewer failed for run %s", run_id)
+        try:
+            await websocket.close(code=1011, reason="terminal viewer failed")
+        except Exception:
+            pass
+    finally:
+        if subscription is not None and user_id:
+            await unsubscribe_agent_terminal_viewer(
+                user_id=user_id, run_id=run_id, viewer=subscription
+            )
 
 
 @router.get("/orchestrations/{run_id}")

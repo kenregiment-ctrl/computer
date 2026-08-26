@@ -4,6 +4,7 @@ const fixtures = [
 	{ id: 'tools-surface', heading: 'Tools' },
 	{ id: 'tool-servers-surface', heading: 'Tool Servers' },
 	{ id: 'terminal-surface', heading: 'Shell' },
+	{ id: 'agent-terminal-pane-surface', heading: 'Heidi terminal' },
 	{ id: 'tool-call-surface', heading: 'run_command' }
 ] as const;
 
@@ -68,8 +69,23 @@ test('status and action affordances remain visible at narrow width', async ({ pa
 	await expect(page.getByTestId('tool-servers-surface').getByText('Available')).toBeVisible();
 	await expect(page.getByTestId('tool-call-surface').getByText('Done')).toBeVisible();
 	await expect(page.getByTestId('terminal-surface').getByText('Live session')).toBeVisible();
-await expect(page.getByTestId('live-terminal-surface').getByText('Live terminal')).toBeVisible();
+	await expect(page.getByTestId('agent-terminal-pane-surface').getByText('Live observer')).toBeVisible();
+	await expect(page.getByTestId('live-terminal-surface').getByText('Live terminal')).toBeVisible();
+
 await expect(page.getByTestId('live-terminal-surface').getByText('npm test -- --runInBand')).toBeVisible();
+});
+
+test('Heidi observer terminal presents a read-only terminal-first surface', async ({ page }) => {
+	await page.goto('/__visual-regression');
+	const surface = page.getByTestId('agent-terminal-pane-surface');
+	await expect(surface.getByTestId('agent-terminal-pane')).toBeVisible();
+	await expect(surface.getByText('read-only mirror', { exact: true })).toBeVisible();
+	await expect(surface.locator('canvas').first()).toBeVisible();
+	await expect(surface.getByRole('button', { name: 'Collapse' })).toBeVisible();
+	await surface.getByRole('button', { name: 'Collapse' }).click();
+	await expect(surface.getByRole('button', { name: 'Expand' })).toBeVisible();
+	const overflow = await surface.evaluate((element) => element.scrollWidth > element.clientWidth);
+	expect(overflow, 'observer terminal is horizontally clipped').toBe(false);
 });
 
 test('Heidi live terminal preserves safe activity and controls', async ({ page }) => {

@@ -16,7 +16,10 @@ export default defineConfig({
 	testDir: './tests/visual',
 	timeout: 30_000,
 	expect: { timeout: 15_000 },
-	fullyParallel: true,
+	// xterm canvas fixtures allocate GPU resources; keep screenshot checks serial so
+	// concurrent browser contexts cannot crash and hide genuine UI regressions.
+	fullyParallel: false,
+	workers: 1,
 	use: {
 		baseURL: 'http://127.0.0.1:4175',
 		trace: 'retain-on-failure',

@@ -30,6 +30,13 @@ MAX_COMMAND_CHARS = 12_000
 MAX_RESULT_CHARS = 24_000
 DEFAULT_TIMEOUT_SECONDS = 120.0
 _PROTOCOL_OUTPUT = re.compile(r"__CPTR_AGENT_(?:READY|DONE)_[0-9a-f]+__(?:[0-9]+__)?")
+_PROTOCOL_OUTPUT_BYTES = re.compile(rb"__CPTR_AGENT_(?:READY|DONE)_[0-9a-f]+__(?:[0-9]+__)?")
+_PROTOCOL_PREFIX_BYTES = b"__CPTR_AGENT_"
+# CSI/OSC control bytes (including bracketed-paste toggles) are correct for an
+# xterm viewer but not for AI event summaries or structured command results.
+_ANSI_ESCAPE = re.compile(r"\x1B(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))")
+TERMINAL_VIEWER_REPLAY_BYTES = 512 * 1024
+TERMINAL_VIEWER_QUEUE_CHUNKS = 128
 
 _DANGEROUS_COMMANDS = (
     re.compile(r"(^|[;&|])\s*(?:sudo\s+)?(?:shutdown|reboot|poweroff)\b", re.I),
@@ -43,6 +50,15 @@ _DANGEROUS_COMMANDS = (
 
 class AgentTerminalPolicyError(RuntimeError):
     """Raised when server-side agent terminal gates reject a request."""
+
+
+@dataclass(eq=False)
+class TerminalViewerSubscription:
+    """One authorized, read-only attachment to an agent-owned terminal."""
+
+    queue: asyncio.Queue[bytes | None]
+    replay_truncated: bool = False
+    closed: bool = False
 
 
 @dataclass
@@ -60,6 +76,11 @@ class _OwnedSession:
     reader_task: asyncio.Task | None = None
     ready: bool = False
     closed: bool = False
+    viewer_buffer: bytearray = field(default_factory=bytearray)
+    viewer_total_bytes: int = 0
+    viewer_pending: bytes = b""
+    viewer_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    viewers: set[TerminalViewerSubscription] = field(default_factory=set)
 
 
 _sessions: dict[tuple[str, str], _OwnedSession] = {}
@@ -73,7 +94,133 @@ def _bounded(text: str, limit: int = MAX_RESULT_CHARS) -> tuple[str, bool]:
 
 
 def _display_output(chunk: bytes) -> str:
-    return _PROTOCOL_OUTPUT.sub("", chunk.decode("utf-8", errors="replace"))
+    """Produce safe plain text for AI/event consumers, not the xterm mirror."""
+    text = _PROTOCOL_OUTPUT.sub("", chunk.decode("utf-8", errors="replace"))
+    return _ANSI_ESCAPE.sub("", text).replace("\r\n", "\n").replace("\r", "")
+
+
+async def _publish_viewer_bytes(owned: _OwnedSession, chunk: bytes) -> None:
+    """Fan raw terminal bytes to viewers without adding a second PTY reader.
+
+    The agent runtime owns the only ``session.read`` call. Viewer clients receive
+    a mirrored byte stream from this broker and cannot influence the PTY.
+    Internal completion markers are stripped incrementally so a split marker is
+    never exposed to the browser.
+    """
+    data = owned.viewer_pending + chunk
+    cleaned = _PROTOCOL_OUTPUT_BYTES.sub(b"", data)
+    marker_start = cleaned.rfind(_PROTOCOL_PREFIX_BYTES)
+    if marker_start >= 0:
+        output = cleaned[:marker_start]
+        owned.viewer_pending = cleaned[marker_start:]
+    else:
+        output = cleaned
+        owned.viewer_pending = b""
+    if not output:
+        return
+
+    async with owned.viewer_lock:
+        owned.viewer_buffer.extend(output)
+        owned.viewer_total_bytes += len(output)
+        if len(owned.viewer_buffer) > TERMINAL_VIEWER_REPLAY_BYTES:
+            del owned.viewer_buffer[: len(owned.viewer_buffer) - TERMINAL_VIEWER_REPLAY_BYTES]
+        stale: list[TerminalViewerSubscription] = []
+        for viewer in owned.viewers:
+            if viewer.closed:
+                stale.append(viewer)
+                continue
+            try:
+                viewer.queue.put_nowait(output)
+            except asyncio.QueueFull:
+                # A slow observer must never block the agent's PTY reader.
+                viewer.closed = True
+                stale.append(viewer)
+        for viewer in stale:
+            owned.viewers.discard(viewer)
+            try:
+                viewer.queue.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+
+
+async def _close_terminal_viewers(owned: _OwnedSession) -> None:
+    """Flush non-protocol tail bytes and close every observer subscription."""
+    async with owned.viewer_lock:
+        tail = _PROTOCOL_OUTPUT_BYTES.sub(b"", owned.viewer_pending)
+        owned.viewer_pending = b""
+        if tail:
+            owned.viewer_buffer.extend(tail)
+            owned.viewer_total_bytes += len(tail)
+            if len(owned.viewer_buffer) > TERMINAL_VIEWER_REPLAY_BYTES:
+                del owned.viewer_buffer[: len(owned.viewer_buffer) - TERMINAL_VIEWER_REPLAY_BYTES]
+        viewers = list(owned.viewers)
+        owned.viewers.clear()
+        for viewer in viewers:
+            if tail and not viewer.closed:
+                try:
+                    viewer.queue.put_nowait(tail)
+                except asyncio.QueueFull:
+                    pass
+            viewer.closed = True
+            try:
+                viewer.queue.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+
+
+async def subscribe_agent_terminal_viewer(
+    *, user_id: str, run_id: str, offset: int = 0
+) -> TerminalViewerSubscription | None:
+    """Attach an authorized read-only viewer to a live FlowDeck-owned PTY.
+
+    This function deliberately exposes no terminal session ID and no write,
+    resize, or signal capability. The returned subscription receives a bounded
+    replay followed by live bytes from the sole agent-owned reader.
+    """
+    key = (user_id, run_id)
+    async with _sessions_lock:
+        owned = _sessions.get(key)
+        if owned is None or owned.closed or not owned.ready or not owned.session.is_alive():
+            return None
+        requested = max(0, int(offset))
+        async with owned.viewer_lock:
+            # The buffer is a tail-only replay window. Offsets are absolute
+            # positions in the ephemeral stream, so a stale client receives
+            # the retained tail and an explicit truncation indication.
+            available_from = owned.viewer_total_bytes - len(owned.viewer_buffer)
+            available_to = owned.viewer_total_bytes
+            truncated = requested < available_from or requested > available_to
+            start = 0 if truncated else requested - available_from
+            replay = bytes(owned.viewer_buffer[start:])
+            viewer = TerminalViewerSubscription(
+                queue=asyncio.Queue(maxsize=TERMINAL_VIEWER_QUEUE_CHUNKS),
+                replay_truncated=truncated,
+            )
+            if replay:
+                viewer.queue.put_nowait(replay)
+            owned.viewers.add(viewer)
+            return viewer
+
+
+async def unsubscribe_agent_terminal_viewer(
+    *, user_id: str, run_id: str, viewer: TerminalViewerSubscription
+) -> None:
+    """Detach one browser observer without touching the agent PTY."""
+    async with _sessions_lock:
+        owned = _sessions.get((user_id, run_id))
+        if owned is None:
+            viewer.closed = True
+            return
+        async with owned.viewer_lock:
+            owned.viewers.discard(viewer)
+            viewer.closed = True
+
+
+async def agent_terminal_viewer_available(*, user_id: str, run_id: str) -> bool:
+    """Return whether an owner may attach a mirror to the active terminal."""
+    async with _sessions_lock:
+        owned = _sessions.get((user_id, run_id))
+        return bool(owned and owned.ready and not owned.closed and owned.session.is_alive())
 
 
 def _workspace_root(raw: Any) -> Path:
@@ -201,16 +348,49 @@ async def _command_interrupted(
     )
 
 
+async def _terminal_read(session: TerminalSession) -> bytes:
+    """Read one PTY chunk without creating Unix worker threads before a fork."""
+    if os.name == "nt":
+        return await asyncio.to_thread(session.read, 4096)
+
+    # The Unix PTY master is non-blocking. Waiting for readiness through the
+    # event loop avoids both polling and a worker thread that would make a later
+    # ``fork`` unsafe. Cancellation removes the reader immediately during a
+    # timeout or run cancellation.
+    loop = asyncio.get_running_loop()
+    ready = loop.create_future()
+
+    def mark_ready() -> None:
+        if not ready.done():
+            ready.set_result(None)
+
+    loop.add_reader(session._fd, mark_ready)
+    try:
+        await ready
+    finally:
+        loop.remove_reader(session._fd)
+    return session.read(4096)
+
+
+async def _terminal_write(session: TerminalSession, data: bytes) -> None:
+    """Write one PTY chunk while keeping Unix agent sessions fork-safe."""
+    if os.name == "nt":
+        await asyncio.to_thread(session.write, data)
+    else:
+        session.write(data)
+
+
 async def _read_loop(owned: _OwnedSession) -> None:
     try:
         while not owned.closed:
-            chunk = await asyncio.to_thread(owned.session.read, 4096)
+            chunk = await _terminal_read(owned.session)
             if chunk:
                 owned.buffer.extend(chunk)
                 if len(owned.buffer) > MAX_RESULT_CHARS * 2:
                     del owned.buffer[: len(owned.buffer) - MAX_RESULT_CHARS * 2]
                 owned.changed.set()
                 if owned.ready:
+                    await _publish_viewer_bytes(owned, chunk)
                     await owned.observer(
                         "command_output",
                         {
@@ -230,6 +410,8 @@ async def _read_loop(owned: _OwnedSession) -> None:
         raise
     except Exception:
         owned.changed.set()
+    finally:
+        await _close_terminal_viewers(owned)
 
 
 async def _wait_for_marker(owned: _OwnedSession, marker: bytes, timeout: float) -> bytes:
@@ -243,11 +425,11 @@ async def _wait_for_marker(owned: _OwnedSession, marker: bytes, timeout: float) 
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             raise asyncio.TimeoutError
+        # Poll cooperatively as well as accepting reader notifications. A silent
+        # command such as ``sleep`` must still reach its deadline even when the
+        # PTY produces no further bytes.
         owned.changed.clear()
-        try:
-            await asyncio.wait_for(owned.changed.wait(), min(remaining, 0.25))
-        except asyncio.TimeoutError:
-            continue
+        await asyncio.sleep(min(remaining, 0.05))
 
 
 async def _wait_for_completion(
@@ -264,11 +446,10 @@ async def _wait_for_completion(
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             raise asyncio.TimeoutError
+        # Do not depend on another PTY read to make time progress: commands may
+        # intentionally be silent until they either complete or time out.
         owned.changed.clear()
-        try:
-            await asyncio.wait_for(owned.changed.wait(), min(remaining, 0.25))
-        except asyncio.TimeoutError:
-            continue
+        await asyncio.sleep(min(remaining, 0.05))
 
 
 async def _new_session(
@@ -279,7 +460,11 @@ async def _new_session(
     context: dict[str, Any],
 ) -> _OwnedSession:
     identity = await identity_for_context({"request": context.get("request"), "user_id": user_id})
-    terminal = await asyncio.to_thread(manager.create, identity, cwd=str(workspace))
+    # ``manager.create`` uses ``os.fork`` on Unix. Forking it from an
+    # ``asyncio.to_thread`` worker can deadlock an interactive child after the
+    # event loop has created helper threads, leaving the live terminal stuck at
+    # its prompt. PTY creation is short and must stay on the event-loop thread.
+    terminal = manager.create(identity, cwd=str(workspace))
     owned = _OwnedSession(
         run_id=run_id,
         user_id=user_id,
@@ -294,8 +479,8 @@ async def _new_session(
     # TerminalSession starts an interactive shell; wait for its rcfile and
     # controlling-terminal setup before sending the protocol handshake.
     await asyncio.sleep(0.1)
-    await asyncio.to_thread(
-        terminal.write,
+    await _terminal_write(
+        terminal,
         (
             "stty -echo 2>/dev/null; "
             "PS1=''; PROMPT_COMMAND=''; export PS1 PROMPT_COMMAND; "
@@ -351,6 +536,7 @@ async def _get_session(context: dict[str, Any], cwd: Any) -> _OwnedSession:
 
 async def _close_owned(key: tuple[str, str], owned: _OwnedSession) -> None:
     owned.closed = True
+    await _close_terminal_viewers(owned)
     if owned.reader_task:
         owned.reader_task.cancel()
         with suppress(asyncio.CancelledError):
@@ -431,10 +617,10 @@ async def execute_agent_terminal_command(
                 "__cptr_status=$?\n"
                 f"printf '\\n{marker.decode()}%s__\\n' \"$__cptr_status\"\n"
             )
-            await asyncio.to_thread(owned.session.write, wrapped.encode())
+            await _terminal_write(owned.session, wrapped.encode())
             raw, exit_code = await _wait_for_completion(owned, marker, timeout)
             output = redact_terminal_text(
-                raw.decode("utf-8", errors="replace"),
+                _display_output(raw),
                 limit=config.max_terminal_output_chars,
             )
             output, truncated = _bounded(output, config.max_terminal_output_chars)

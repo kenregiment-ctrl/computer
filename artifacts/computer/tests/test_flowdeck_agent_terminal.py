@@ -7,9 +7,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import cptr.flowdeck.agent_terminal as agent_terminal
 from cptr.flowdeck.agent_terminal import (
+    _OwnedSession,
+    _publish_viewer_bytes,
     close_agent_terminal,
     execute_agent_terminal_command,
+    subscribe_agent_terminal_viewer,
+    unsubscribe_agent_terminal_viewer,
 )
 from cptr.flowdeck.config import FlowDeckConfig
 from cptr.flowdeck.durable import RunStatus
@@ -103,6 +108,79 @@ class FlowDeckAgentTerminalTests(unittest.IsolatedAsyncioTestCase):
                 if kind == "command_output"
             )
         )
+
+    async def test_authorized_viewer_receives_mirrored_output_without_protocol_markers(self):
+        class FakeTerminal:
+            def is_alive(self):
+                return True
+
+        key = ("terminal-test-user", "terminal-test-run")
+        owned = _OwnedSession(
+            run_id=key[1],
+            user_id=key[0],
+            workspace=Path(tempfile.gettempdir()),
+            session=FakeTerminal(),
+            observer=self.observe_noop,
+            ready=True,
+        )
+        async with agent_terminal._sessions_lock:
+            agent_terminal._sessions[key] = owned
+        try:
+            viewer = await subscribe_agent_terminal_viewer(user_id=key[0], run_id=key[1])
+            self.assertIsNotNone(viewer)
+            assert viewer is not None
+            await _publish_viewer_bytes(owned, b"viewer-visible\n__CPTR_AGENT_DO")
+            await _publish_viewer_bytes(
+                owned,
+                b"NE_0123456789abcdef0123456789abcdef__0__\n",
+            )
+            chunk = await asyncio.wait_for(viewer.queue.get(), timeout=1)
+            self.assertEqual(chunk, b"viewer-visible\n")
+            tail = await asyncio.wait_for(viewer.queue.get(), timeout=1)
+            self.assertNotIn(b"__CPTR_AGENT_", tail or b"")
+            await unsubscribe_agent_terminal_viewer(user_id=key[0], run_id=key[1], viewer=viewer)
+        finally:
+            async with agent_terminal._sessions_lock:
+                agent_terminal._sessions.pop(key, None)
+
+    async def test_real_agent_pty_streams_to_a_read_only_viewer(self):
+        with tempfile.TemporaryDirectory() as temp:
+            context = {
+                "user_id": "terminal-test-user",
+                "flowdeck_run_id": "terminal-test-run",
+                "workspace": temp,
+                "request": None,
+                "terminal_observer": self.observe_noop,
+            }
+            with patch.dict(os.environ, self.enabled_env(), clear=False):
+                command_task = asyncio.create_task(
+                    execute_agent_terminal_command(
+                        "printf viewer-visible; sleep 0.15", __context__=context
+                    )
+                )
+                viewer = None
+                for _ in range(100):
+                    viewer = await subscribe_agent_terminal_viewer(
+                        user_id="terminal-test-user", run_id="terminal-test-run"
+                    )
+                    if viewer is not None:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertIsNotNone(viewer)
+                assert viewer is not None
+                chunks: list[bytes] = []
+                while b"viewer-visible" not in b"".join(chunks):
+                    chunk = await asyncio.wait_for(viewer.queue.get(), timeout=2)
+                    self.assertIsNotNone(chunk)
+                    chunks.append(chunk or b"")
+                result = json.loads(await command_task)
+                await unsubscribe_agent_terminal_viewer(
+                    user_id="terminal-test-user", run_id="terminal-test-run", viewer=viewer
+                )
+        mirrored = b"".join(chunks).decode("utf-8", errors="replace")
+        self.assertEqual(result["status"], "succeeded")
+        self.assertIn("viewer-visible", mirrored)
+        self.assertNotIn("__CPTR_AGENT_", mirrored)
 
     async def test_rejects_dangerous_and_out_of_workspace_requests(self):
         with tempfile.TemporaryDirectory() as temp:

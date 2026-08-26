@@ -45,6 +45,7 @@
 		stopSignal?: number;
 		forceStopSignal?: number;
 		readOnly?: boolean;
+		observerMode?: boolean;
 	}
 
 	let {
@@ -54,7 +55,8 @@
 		initialOffset = 0,
 		stopSignal = 0,
 		forceStopSignal = 0,
-		readOnly = false
+		readOnly = false,
+		observerMode = false
 	}: Props = $props();
 
 	let containerEl: HTMLDivElement | undefined = $state();
@@ -68,6 +70,7 @@
 	let destroyed = false;
 	let lastSentCols = 0;
 	let lastSentRows = 0;
+	let observerOffset = initialOffset;
 
 	// ── Wake Lock ─────────────────────────────────────────────
 	// Keeps the screen alive during terminal sessions so long-running
@@ -133,10 +136,13 @@
 		const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 		const path = wsPath || `/api/terminal/${sid}/ws`;
 		const url = new URL(path, `${window.location.protocol}//${window.location.host}`);
-		if (initialOffset > 0) url.searchParams.set('offset', String(initialOffset));
+		const offset = observerMode ? observerOffset : initialOffset;
+		if (offset > 0) url.searchParams.set('offset', String(offset));
 		url.protocol = proto;
 		return url.toString();
 	}
+
+	const isReadOnly = $derived(readOnly || observerMode);
 
 	function doFit() {
 		if (!fitAddon || !term || !containerEl) return;
@@ -182,7 +188,7 @@
 	// Writes directly into the pre-allocated buffer. Zero allocation
 	// for the common single-ASCII-keystroke path.
 	function sendInput(data: string) {
-		if (readOnly) return;
+		if (isReadOnly) return;
 		if (ws?.readyState !== WebSocket.OPEN) return;
 
 		if (data.length === 1 && data.charCodeAt(0) < 128) {
@@ -216,7 +222,7 @@
 
 	let lastStopSignal = 0;
 	$effect(() => {
-		if (!stopSignal || stopSignal === lastStopSignal) return;
+		if (observerMode || !stopSignal || stopSignal === lastStopSignal) return;
 		lastStopSignal = stopSignal;
 		if (ws?.readyState === WebSocket.OPEN) {
 			ws.send(new Uint8Array([MSG_STOP]));
@@ -225,7 +231,7 @@
 
 	let lastForceStopSignal = 0;
 	$effect(() => {
-		if (!forceStopSignal || forceStopSignal === lastForceStopSignal) return;
+		if (observerMode || !forceStopSignal || forceStopSignal === lastForceStopSignal) return;
 		lastForceStopSignal = forceStopSignal;
 		if (ws?.readyState === WebSocket.OPEN) {
 			ws.send(new Uint8Array([MSG_FORCE_STOP]));
@@ -233,7 +239,7 @@
 	});
 
 	$effect(() => {
-		if (term) term.options.disableStdin = readOnly;
+		if (term) term.options.disableStdin = isReadOnly;
 	});
 
 	onMount(() => {
@@ -258,7 +264,7 @@
 			lineHeight: 1.3,
 			scrollback: 10000,
 			macOptionClickForcesSelection: true,
-			disableStdin: readOnly,
+			disableStdin: isReadOnly,
 			theme: terminalTheme()
 		});
 
@@ -343,6 +349,9 @@
 		});
 
 		term.onResize(({ cols, rows }: { cols: number; rows: number }) => {
+			// Observer mode reflows locally only. A browser viewport must never
+			// alter the dimensions of an agent-owned PTY.
+			if (observerMode) return;
 			// Skip if dimensions haven't actually changed. Prevents duplicate
 			// SIGWINCH when keyboard open/close triggers multiple fit cycles.
 			if (cols === lastSentCols && rows === lastSentRows) return;
@@ -465,7 +474,7 @@
 
 		ws.onopen = () => {
 			console.log(`[terminal] WebSocket open for ${label}`);
-			if (term) {
+			if (term && !observerMode) {
 				// Send ONE resize message with current dimensions.
 				// Do NOT call doFit() here; that would trigger term.onResize
 				// which sends a SECOND resize message, causing rich CLI apps
@@ -478,15 +487,33 @@
 		};
 
 		ws.onmessage = (event) => {
+			if (typeof event.data === 'string') {
+				// FlowDeck observer transport uses text only for safe connection
+				// metadata such as replay truncation; it never accepts controls.
+				try {
+					const message = JSON.parse(event.data);
+					if (message?.type === 'replay_truncated') {
+						term?.write('\r\n[Earlier live output is no longer retained; showing the available tail.]\r\n');
+					}
+				} catch {
+					// Ignore malformed non-terminal control metadata.
+				}
+				return;
+			}
 			// binaryType='arraybuffer' guarantees ArrayBuffer; write
 			// directly with a Uint8Array view (zero-copy wrapper)
-			term?.write(new Uint8Array(event.data as ArrayBuffer));
+			const bytes = new Uint8Array(event.data as ArrayBuffer);
+			if (observerMode) observerOffset += bytes.byteLength;
+			term?.write(bytes);
 			trackOutputForHaptics();
 		};
 
 		ws.onclose = (e) => {
 			console.log(`[terminal] WebSocket closed for ${label}, code=${e.code}, reason=${e.reason}`);
 			if (destroyed) return;
+			// A normal or policy close means the agent-owned stream has ended or
+			// is unavailable. Keep the captured buffer visible without retrying.
+			if (observerMode && [1000, 4401, 4403, 4404].includes(e.code)) return;
 			reconnectTimer = setTimeout(() => {
 				if (!destroyed) connectWebSocket();
 			}, 2000);
@@ -526,12 +553,17 @@
 				<span class="size-1.5 rounded-full bg-emerald-500 shadow-[0_0_0_3px_color-mix(in_srgb,#10b981_14%,transparent)]"></span>
 			</span>
 			<span class="truncate text-[0.6875rem] font-medium text-gray-700 dark:text-gray-300">Shell</span>
-			<span class="font-mono text-[0.5625rem] uppercase tracking-wider text-gray-400 dark:text-gray-600">
-				{readOnly ? 'Read only' : 'Live session'}
-			</span>
+							<span class="font-mono text-[0.5625rem] uppercase tracking-wider text-gray-400 dark:text-gray-600">
+					{observerMode ? 'Live observer' : readOnly ? 'Read only' : 'Live session'}
+				</span>
+
 		</div>
 		<div class="hidden items-center gap-2 font-mono text-[0.5625rem] text-gray-400 dark:text-gray-600 sm:flex">
-			<span>PTY</span><span class="text-gray-300 dark:text-gray-700">·</span><span>⌘K shortcuts</span>
+			{#if observerMode}
+				<span>Read-only mirror</span>
+			{:else}
+				<span>PTY</span><span class="text-gray-300 dark:text-gray-700">·</span><span>⌘K shortcuts</span>
+			{/if}
 		</div>
 	</div>
 	<div bind:this={containerEl} class="min-h-0 flex-1 overflow-hidden px-2 pt-2"></div>

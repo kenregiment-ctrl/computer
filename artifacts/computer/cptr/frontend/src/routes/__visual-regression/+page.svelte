@@ -4,7 +4,9 @@
 	import Terminal from '$lib/components/Terminal.svelte';
 	import ToolCallCollapsible from '$lib/components/chat/ToolCallCollapsible.svelte';
 	import DesignerResults from '$lib/components/chat/DesignerResults.svelte';
-import LiveTerminal from '$lib/components/chat/LiveTerminal.svelte';
+	import AgentTerminalPane from '$lib/components/chat/AgentTerminalPane.svelte';
+	import LiveTerminal from '$lib/components/chat/LiveTerminal.svelte';
+
 	import { designerVisualFixture } from '$lib/components/chat/designer-fixtures';
 
 	const toolCall = {
@@ -200,16 +202,29 @@ impact: 'The fixture preserves the compact audit report within the terminal.'
 			/>
 		</section>
 
-<section
-data-testid="live-terminal-surface"
-class="min-w-0 rounded-2xl border border-gray-200/70 p-3 dark:border-white/7"
->
-<LiveTerminal
-events={liveTerminalEvents}
-status="verifying"
-runId="run-live-terminal-fixture"
-isAudit={true}
-/>
-</section>
+	<section
+	data-testid="agent-terminal-pane-surface"
+	class="min-w-0 rounded-2xl border border-gray-200/70 p-3 dark:border-white/7"
+	>
+	<AgentTerminalPane
+	runId="run-terminal-viewer-fixture"
+	status="running"
+	wsPath="/v1/flowdeck/orchestrations/run-terminal-viewer-fixture/terminal-view/ws?workspace=visual"
+	initialOutput={'\u001b[32m$\u001b[0m npm test -- --runInBand\r\n276 passed, 4 skipped\r\n'}
+	/>
+	</section>
+
+	<section
+	data-testid="live-terminal-surface"
+	class="min-w-0 rounded-2xl border border-gray-200/70 p-3 dark:border-white/7"
+	>
+	<LiveTerminal
+	events={liveTerminalEvents}
+	status="verifying"
+	runId="run-live-terminal-fixture"
+	isAudit={true}
+	/>
+	</section>
+
 	</div>
 </main>
